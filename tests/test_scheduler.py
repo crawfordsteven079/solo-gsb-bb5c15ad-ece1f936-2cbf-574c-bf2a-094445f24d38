@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app.scheduler import (
+    HandoffLeg,
     Instance,
     RestViolation,
     StaffingGap,
@@ -11,6 +12,8 @@ from app.scheduler import (
     common_free_slots,
     expand_schedule,
     find_overlaps,
+    handoff_route,
+    intersect_intervals,
     interval_difference,
     merge_intervals,
     occupancy_by_day,
@@ -691,3 +694,183 @@ def test_schedule_changes_empty_sides():
         before_intervals=[],
         after_intervals=[],
     ) == ([], [])
+
+
+# --- handoff_route / intersect_intervals -------------------------------------
+
+
+def test_intersect_intervals_basic_and_touch():
+    # [08,10) 与 [09,11) 交 [09,10)；相接（终点 == 起点）交集为空
+    assert intersect_intervals(
+        [(_utc(1, 8), _utc(1, 10))], [(_utc(1, 9), _utc(1, 11))]
+    ) == [(_utc(1, 9), _utc(1, 10))]
+    assert (
+        intersect_intervals(
+            [(_utc(1, 8), _utc(1, 9))], [(_utc(1, 9), _utc(1, 10))]
+        )
+        == []
+    )
+    # 多段：[8,10)+[14,16) 与 [9,15) 交 [9,10)+[14,15)
+    assert intersect_intervals(
+        [(_utc(1, 8), _utc(1, 10)), (_utc(1, 14), _utc(1, 16))],
+        [(_utc(1, 9), _utc(1, 15))],
+    ) == [(_utc(1, 9), _utc(1, 10)), (_utc(1, 14), _utc(1, 15))]
+
+
+def _handoff(**overrides):
+    kwargs = dict(
+        message_at=_utc(1, 0),
+        deadline=_utc(2, 0),
+        holder="a",
+        target="c",
+        duration_minutes=30,
+        employee_intervals={},
+    )
+    kwargs.update(overrides)
+    return handoff_route(**kwargs)
+
+
+def test_handoff_holder_is_target_returns_message_time_empty_chain():
+    arrival, chain = _handoff(target="a")
+    assert arrival == _utc(1, 0)
+    assert chain == []
+
+
+def test_handoff_direct_earliest_overlap():
+    # a 在岗 [08,12)，c 在岗 [09,11)：共同段 [09,11)，交接 30 分钟 -> [09,09:30)
+    arrival, chain = _handoff(
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 12))],
+            "c": [(_utc(1, 9), _utc(1, 11))],
+        }
+    )
+    assert arrival == _utc(1, 9, 30)
+    assert chain == [HandoffLeg("a", "c", _utc(1, 9), _utc(1, 9, 30))]
+
+
+def test_handoff_touching_shifts_merge_before_overlap():
+    # a 两段相接 [08,09)+[09,10) 合并为 [08,10)；c [09:30,11)：
+    # 合并后才能在连续共同在岗 [09:30,10) 内完成 30 分钟交接
+    arrival, chain = _handoff(
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 9)), (_utc(1, 9), _utc(1, 10))],
+            "c": [(_utc(1, 9, 30), _utc(1, 11))],
+        }
+    )
+    assert arrival == _utc(1, 10)
+    assert chain == [HandoffLeg("a", "c", _utc(1, 9, 30), _utc(1, 10))]
+
+
+def test_handoff_message_ready_caps_start():
+    # 消息 09:15 才产生（a 自 08 起在岗）；共同段 [08,12)，交接自 09:15 起
+    arrival, chain = _handoff(
+        message_at=_utc(1, 9, 15),
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 12))],
+            "c": [(_utc(1, 8), _utc(1, 12))],
+        },
+    )
+    assert arrival == _utc(1, 9, 45)
+    assert chain == [HandoffLeg("a", "c", _utc(1, 9, 15), _utc(1, 9, 45))]
+
+
+def test_handoff_holder_keeps_message_off_duty_and_waits():
+    # a [08,09) 与 c [08:40,09:30) 共同段仅 20 分钟，不足 30；a 下一班
+    # [12,13) 与 c [12,13) 完整共同在岗 -> 离岗期间保留消息，12:30 完成交接
+    arrival, chain = _handoff(
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 9)), (_utc(1, 12), _utc(1, 13))],
+            "c": [(_utc(1, 8, 40), _utc(1, 9, 30)), (_utc(1, 12), _utc(1, 13))],
+        }
+    )
+    assert arrival == _utc(1, 12, 30)
+    assert chain == [HandoffLeg("a", "c", _utc(1, 12), _utc(1, 12, 30))]
+
+
+def test_handoff_multihop_chain():
+    # a 与 c 从不共同在岗，经 b 中转：
+    # a[08,10) 与 b[08:30,09:30) -> b 09:00 持有；b[11,12) 与 c[11,13) -> c 11:30
+    arrival, chain = _handoff(
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 10))],
+            "b": [(_utc(1, 8, 30), _utc(1, 9, 30)), (_utc(1, 11), _utc(1, 12))],
+            "c": [(_utc(1, 11), _utc(1, 13))],
+        }
+    )
+    assert arrival == _utc(1, 11, 30)
+    assert chain == [
+        HandoffLeg("a", "b", _utc(1, 8, 30), _utc(1, 9)),
+        HandoffLeg("b", "c", _utc(1, 11), _utc(1, 11, 30)),
+    ]
+
+
+def test_handoff_earliest_route_beats_direct_later():
+    # 直交 a->c 共同在岗 13:15 才出现（13:45 到达）；经 b 中转 11:30 即可到达
+    arrival, chain = _handoff(
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 9)), (_utc(1, 13), _utc(1, 14))],
+            "b": [(_utc(1, 8, 30), _utc(1, 9, 30)), (_utc(1, 11), _utc(1, 12))],
+            "c": [(_utc(1, 11), _utc(1, 13)), (_utc(1, 13, 15), _utc(1, 14, 15))],
+        }
+    )
+    assert arrival == _utc(1, 11, 30)
+    assert [leg.receiver for leg in chain] == ["b", "c"]
+    assert chain[0] == HandoffLeg("a", "b", _utc(1, 8, 30), _utc(1, 9))
+    assert chain[1] == HandoffLeg("b", "c", _utc(1, 11), _utc(1, 11, 30))
+
+
+def test_handoff_no_overlap_returns_null():
+    arrival, chain = _handoff(
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 9))],
+            "c": [(_utc(1, 20), _utc(1, 21))],
+        }
+    )
+    assert arrival is None
+    assert chain == []
+
+
+def test_handoff_joint_segment_too_short_returns_null():
+    # 共同在岗仅 20 分钟，交接需 30 分钟 -> 无解
+    arrival, chain = _handoff(
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 9))],
+            "c": [(_utc(1, 8, 40), _utc(1, 9))],
+        }
+    )
+    assert arrival is None
+    assert chain == []
+
+
+def test_handoff_finish_after_deadline_returns_null():
+    # 共同段 [08:30, 09:00) 可完成交接，但截止 08:45 -> 终点超截止，无解
+    arrival, chain = _handoff(
+        deadline=_utc(1, 8, 45),
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 10))],
+            "c": [(_utc(1, 8, 30), _utc(1, 10))],
+        },
+    )
+    assert arrival is None
+    assert chain == []
+
+
+def test_handoff_finish_exactly_at_deadline_ok():
+    # 终点恰好等于截止时刻（不晚于截止）-> 有解
+    arrival, chain = _handoff(
+        deadline=_utc(1, 9),
+        employee_intervals={
+            "a": [(_utc(1, 8), _utc(1, 10))],
+            "c": [(_utc(1, 8, 30), _utc(1, 10))],
+        },
+    )
+    assert arrival == _utc(1, 9)
+    assert chain == [HandoffLeg("a", "c", _utc(1, 8, 30), _utc(1, 9))]
+
+
+def test_handoff_unreachable_target_with_empty_schedule():
+    arrival, chain = _handoff(
+        employee_intervals={"a": [(_utc(1, 8), _utc(1, 10))], "c": []}
+    )
+    assert arrival is None
+    assert chain == []

@@ -372,6 +372,114 @@ def common_free_slots(
     return slots
 
 
+def intersect_intervals(
+    a: Iterable[tuple[datetime, datetime]],
+    b: Iterable[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """两组按起点排序、两两不相交的半开区间的交集。
+
+    双指针线性扫描；边界相接（一侧终点等于另一侧起点）交集为空，不计入。
+    返回按起点排序的连续共同覆盖段。
+    """
+    left = list(a)
+    right = list(b)
+    i = j = 0
+    result: list[tuple[datetime, datetime]] = []
+    while i < len(left) and j < len(right):
+        a_start, a_end = left[i]
+        b_start, b_end = right[j]
+        lo, hi = max(a_start, b_start), min(a_end, b_end)
+        if lo < hi:  # 半开区间：相接（lo == hi）不算共同覆盖
+            result.append((lo, hi))
+        if a_end < b_end:
+            i += 1
+        else:
+            j += 1
+    return result
+
+
+@dataclass(frozen=True)
+class HandoffLeg:
+    """一次交接：发送者 -> 接收者，交接实际进行的半开 UTC 区间。"""
+
+    sender: str
+    receiver: str
+    start: datetime
+    end: datetime
+
+
+def handoff_route(
+    *,
+    message_at: datetime,
+    deadline: datetime,
+    holder: str,
+    target: str,
+    duration_minutes: int,
+    employee_intervals: dict[str, list[tuple[datetime, datetime]]],
+) -> tuple[datetime | None, list[HandoffLeg]]:
+    """求消息不晚于 deadline 到达 target 的最早时刻及一条交接链。
+
+    每名员工的半开在岗区间先合并相交或相接者，并裁剪到
+    [message_at, deadline]。任意两人均可交接，但一次交接必须在双方的一段
+    **连续共同在岗**区间（各自合并后区间的交集）内完整完成；发送者最早于
+    持有消息的时刻开始（start = max(共同段起点, 持有时刻)），接收者在交接
+    终点获得消息。持有期间离岗不丢失消息，可等待下一次共同在岗。
+
+    边的到达时刻关于出发时刻单调不减（迟到只会更晚到达，因为总可等待），
+    故用时间相关 Dijkstra：按最早持有时刻依次确定每名员工，松弛其与其余
+    员工的交接。无解返回 (None, [])；holder == target 时立即在产生时刻到达。
+    """
+    if holder == target:
+        return message_at, []
+
+    duration = timedelta(minutes=duration_minutes)
+
+    # 合并相交或相接的在岗段（跨班次连续在岗视同一段），再裁剪到求解窗口
+    duty: dict[str, list[tuple[datetime, datetime]]] = {}
+    for emp_id, intervals in employee_intervals.items():
+        clipped = [
+            (max(start, message_at), min(end, deadline))
+            for start, end in merge_intervals(intervals)
+        ]
+        duty[emp_id] = [(start, end) for start, end in clipped if start < end]
+
+    # earliest[id]：消息最早到达 id 的时刻；chains[id]：对应的交接链
+    earliest: dict[str, datetime] = {holder: message_at}
+    chains: dict[str, list[HandoffLeg]] = {holder: []}
+    settled: set[str] = set()
+
+    while True:
+        current = min(
+            (emp for emp in earliest if emp not in settled),
+            key=lambda emp: earliest[emp],
+            default=None,
+        )
+        if current is None:
+            return None, []
+        if current == target:
+            return earliest[target], chains[target]
+        settled.add(current)
+        ready = earliest[current]
+
+        for other, other_duty in duty.items():
+            if other == current or other in settled:
+                continue
+            # 共同在岗段按 UTC 升序：第一段能完整容纳交接的即给出最早到达
+            for joint_start, joint_end in intersect_intervals(
+                duty[current], other_duty
+            ):
+                start = max(joint_start, ready)
+                end = start + duration
+                if end <= joint_end:  # 裁剪后终点必 <= deadline
+                    if other not in earliest or end < earliest[other]:
+                        earliest[other] = end
+                        chains[other] = [
+                            *chains[current],
+                            HandoffLeg(current, other, start, end),
+                        ]
+                    break
+
+
 def interval_difference(
     base: Iterable[tuple[datetime, datetime]],
     subtract: Iterable[tuple[datetime, datetime]],

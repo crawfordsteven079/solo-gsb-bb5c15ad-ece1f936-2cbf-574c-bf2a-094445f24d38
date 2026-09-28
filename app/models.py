@@ -390,3 +390,77 @@ class ScheduleChangesResponse(BaseModel):
     added: list[ScheduleChangeOut] = Field(
         ..., description="新增的最大连续区间，按起点排序；无新增时为空列表"
     )
+
+
+MAX_HANDOFF_WINDOW_DAYS = 31
+
+
+class HandoffRouteRequest(BaseModel):
+    """消息在员工间经共同在岗交接传递到目标员工的路径请求。"""
+
+    message_at_utc: datetime = Field(
+        ..., description="消息产生时刻（初始持有人此时获得消息），UTC，Z 结尾"
+    )
+    deadline_utc: datetime = Field(
+        ..., description="到达截止时刻（交接终点须不晚于此），UTC，Z 结尾"
+    )
+    duration_minutes: int = Field(
+        ..., ge=1, le=1440, description="一次交接所需时长（分钟），1～1440"
+    )
+    holder_id: str = Field(..., min_length=1, description="初始持有人唯一 ID")
+    target_id: str = Field(..., min_length=1, description="目标员工唯一 ID")
+    employees: list[StaffingEmployee] = Field(
+        ..., min_length=1, max_length=20, description="1～20 名员工，ID 唯一"
+    )
+
+    @field_validator("message_at_utc", "deadline_utc", mode="before")
+    @classmethod
+    def _require_z_suffix(cls, v: object) -> object:
+        """两个时刻必须是以 Z 结尾的 UTC ISO 8601 字符串。"""
+        if isinstance(v, str) and not v.endswith("Z"):
+            raise ValueError("must be an ISO 8601 UTC timestamp ending with 'Z'")
+        return v
+
+    @field_validator("message_at_utc", "deadline_utc")
+    @classmethod
+    def _normalize_utc(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("must be a timezone-aware UTC timestamp ending with 'Z'")
+        return v.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _validate_window_and_refs(self) -> "HandoffRouteRequest":
+        if not self.message_at_utc < self.deadline_utc:
+            raise ValueError("message_at_utc must be before deadline_utc")
+        if self.deadline_utc - self.message_at_utc > timedelta(
+            days=MAX_HANDOFF_WINDOW_DAYS
+        ):
+            raise ValueError(
+                f"window must not exceed {MAX_HANDOFF_WINDOW_DAYS} days"
+            )
+        ids = [e.id for e in self.employees]
+        if len(set(ids)) != len(ids):
+            raise ValueError("employee ids must be unique")
+        referenced = {self.holder_id, self.target_id}
+        if not referenced <= set(ids):
+            raise ValueError("holder_id and target_id must reference existing employees")
+        return self
+
+
+class HandoffLegOut(BaseModel):
+    sender_id: str = Field(..., description="交接发送者（消息当前持有人）ID")
+    receiver_id: str = Field(..., description="交接接收者 ID")
+    start_utc: str = Field(..., description="交接开始时刻（含），UTC，Z 结尾")
+    end_utc: str = Field(
+        ..., description="交接结束时刻（不含），接收者此时获得消息，UTC，Z 结尾"
+    )
+
+
+class HandoffRouteResponse(BaseModel):
+    arrival_utc: str | None = Field(
+        ..., description="消息到达目标的最早时刻，UTC，Z 结尾；无解时为 null"
+    )
+    count: int = Field(..., description="交接链长度（交接次数）")
+    chain: list[HandoffLegOut] = Field(
+        ..., description="依次进行的交接（双方 ID 与 UTC 起止）；无解或初始即目标时为空"
+    )

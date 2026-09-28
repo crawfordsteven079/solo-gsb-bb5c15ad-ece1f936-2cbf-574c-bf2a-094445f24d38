@@ -14,7 +14,11 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 按**以窗口起点为原点的步长网格**枚举能完整容纳预约的起止时刻；
 `POST /schedule-changes` 对账同一员工**变更前后两版日程**，
 在半开 UTC 窗口内比较两版工作时间集合，
-输出**取消与新增的最大连续区间**、每段真实分钟数及两类总分钟数。
+输出**取消与新增的最大连续区间**、每段真实分钟数及两类总分钟数；
+`POST /handoff-route` 则把每名员工的日程展开为半开 UTC 在岗区间并合并
+相交或相接者，在**任意两人的连续共同在岗**约束下，求消息经若干次交接
+到达目标员工的**最早时刻与一条交接链**，交接期间发送者须已持有消息，
+持有期间离岗不丢失消息。
 
 ## 快速启动（单条命令）
 
@@ -22,12 +26,14 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 docker compose up --build
 ```
 
-依赖（FastAPI / uvicorn / tzdata）在镜像构建时安装完毕，容器启动即可服务。
+依赖（FastAPI / uvicorn / tzdata）在镜像构建时安装完毕，构建期还会执行一次
+应用导入自检（确认全部接口随镜像就绪）；容器启动即自动监听 8000 端口提供服务，
+无需额外初始化步骤。
 
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`、`/handoff-route`
 
 ## 配置
 
@@ -35,8 +41,9 @@ docker compose up --build
 | --- | --- | --- |
 | `PORT` | `8000` | 宿主机映射端口，如 `PORT=9000 docker compose up --build` 后访问 http://localhost:9000 |
 
-容器内服务固定监听 8000 端口，无需其他配置；时区数据库由镜像内系统 tzdata
-及 pip 包 `tzdata`（兜底）提供。
+容器内服务固定监听 **8000 端口**（Compose 将宿主机 `${PORT:-8000}` 映射到容器
+8000），无需其他配置；时区数据库由镜像内系统 tzdata 及 pip 包 `tzdata`（兜底）
+提供。
 
 ## API
 
@@ -521,6 +528,145 @@ docker compose up --build
 | `start_utc` / `end_utc` | 差异区间起止（半开，UTC，Z 结尾） |
 | `minutes` | 区间真实分钟数（UTC 流逝） |
 
+### `POST /handoff-route`
+
+在 **1～20 名员工**之间规划一条消息交接链：消息在 `message_at_utc` 产生时由
+初始持有人 `holder_id` 获得，需经若干次**任意两人之间**的交接，最终不晚于
+`deadline_utc` 到达目标员工 `target_id`。每次交接耗时固定
+`duration_minutes`（`1`～`1440`），且必须在发送者与接收者的一段**连续共同
+在岗**区间内**完整完成**；交接起点不得早于发送者实际持有消息的时刻（消息
+产生或上一次交接结束），接收者在交接**结束时刻**获得消息。持有人**离岗期间
+仍保留消息**，可等待之后的共同在岗时段。
+
+每名员工携带**可为空**的日程列表（`schedules`，与 `/overlaps` 单侧参数与
+校验完全一致）；`null` 或空列表表示该员工全程不在岗（除初始持有人外无法参与
+交接）。各日程按既有跳时 / 叠时策略展开后，实例按真实时长解释为**半开 UTC
+区间** `[start, start+duration)`；同一员工**相交或相接**的区间先合并为连续
+在岗段（秋回两次实例相接时形成连续覆盖），两人的连续共同在岗段取各自合并后
+区间的交集（**边界相接不算共同覆盖**）。服务在时间轴上做**时间相关最短路**
+（迟到只会更晚到达，Dijkstra 适用），返回消息到达目标的**最早时刻**及一条
+对应交接链；存在并列最早方案时任选其一。
+
+请求体：
+
+```json
+{
+  "message_at_utc": "2026-03-02T00:00:00Z",
+  "deadline_utc": "2026-03-03T00:00:00Z",
+  "duration_minutes": 30,
+  "holder_id": "alice",
+  "target_id": "carol",
+  "employees": [
+    {
+      "id": "alice",
+      "schedules": [
+        {
+          "timezone": "UTC",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "08:00",
+          "duration_minutes": 120
+        }
+      ]
+    },
+    {
+      "id": "bob",
+      "schedules": [
+        {
+          "timezone": "UTC",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "08:30",
+          "duration_minutes": 60
+        },
+        {
+          "timezone": "UTC",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "11:00",
+          "duration_minutes": 60
+        }
+      ]
+    },
+    {
+      "id": "carol",
+      "schedules": [
+        {
+          "timezone": "UTC",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "11:00",
+          "duration_minutes": 120
+        }
+      ]
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `message_at_utc` | string | 消息产生时刻（初始持有人此时获得消息），UTC ISO 8601 且**以 `Z` 结尾** |
+| `deadline_utc` | string | 到达截止时刻（交接终点须 **≤** 该时刻），UTC ISO 8601 且**以 `Z` 结尾**；两时刻须严格递增且相距不超过 31 天 |
+| `duration_minutes` | int | 每次交接的时长（分钟），`1`～`1440` |
+| `holder_id` | string | 初始持有人唯一 ID，必须引用 `employees` 中存在的员工 |
+| `target_id` | string | 目标员工唯一 ID，必须引用 `employees` 中存在的员工 |
+| `employees` | object[] | `1`～`20` 名员工，`id` 唯一 |
+| `employees[].id` | string | 员工唯一 ID |
+| `employees[].schedules` | object[] \| null | 日程列表（与 `/overlaps` 单侧相同）；`null` 或空列表表示无排班 |
+
+响应 `200`（`chain` 按交接先后排列）：
+
+```json
+{
+  "arrival_utc": "2026-03-02T11:30:00Z",
+  "count": 2,
+  "chain": [
+    {
+      "sender_id": "alice",
+      "receiver_id": "bob",
+      "start_utc": "2026-03-02T08:30:00Z",
+      "end_utc": "2026-03-02T09:00:00Z"
+    },
+    {
+      "sender_id": "bob",
+      "receiver_id": "carol",
+      "start_utc": "2026-03-02T11:00:00Z",
+      "end_utc": "2026-03-02T11:30:00Z"
+    }
+  ]
+}
+```
+
+上例中 alice 在岗 `[08:00, 10:00)` UTC、bob 在岗 `[08:30, 09:30)` 与
+`[11:00, 12:00)`、carol 在岗 `[11:00, 13:00)`；alice 与 bob 的连续共同
+在岗 `[08:30, 09:30)` 内完成 30 分钟交接，bob 于 `09:00` 持有消息；bob
+离岗期间消息保留，`11:00` 再与 carol 共同在岗时交接，carol 于 `11:30`
+获得（alice 与 carol 全程无交集，故必须中转）。
+
+| 字段 | 说明 |
+| --- | --- |
+| `arrival_utc` | 消息到达目标的最早时刻（UTC，Z 结尾）；无解时为 `null` |
+| `count` | 交接次数（`chain` 长度） |
+| `chain[].sender_id` / `receiver_id` | 该次交接的发送者（消息当前持有人）与接收者 ID |
+| `chain[].start_utc` / `end_utc` | 交接半开区间起止（UTC，Z 结尾）；`end_utc − start_utc = duration_minutes`，接收者在 `end_utc` 获得消息 |
+
+特殊情形：
+
+- **初始持有人即目标**（`holder_id == target_id`）：无需交接，
+  `arrival_utc` 直接为 `message_at_utc`，`count` 为 0、`chain` 为空。
+- **无解**（窗口内不存在能在截止前完整交接至目标的共同在岗链）：
+  `arrival_utc` 为 `null`，`count` 为 0、`chain` 为空。交接终点恰好等于
+  `deadline_utc` 仍算按时到达。
+- 同一名员工**多段相接或相交**的日程（含秋回 `fold_strategy=both` 产生的
+  两段）先合并为一段连续在岗；跨班次连续在岗期间可完成单次交接。
+- 发送者在共同在岗段开始时若尚未持有消息，交接从其实际持有的时刻起算
+  （如消息产生于一段共同在岗的中间）。
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -540,6 +686,39 @@ docker compose up --build
   （规则与 `/overlaps` 单侧一致）
 - `/schedule-changes`：窗口起止不是以 `Z` 结尾的 UTC 时刻、窗口未递增或
   超过 31 天，或任一版本的日程字段校验失败（规则与 `/overlaps` 单侧一致）
+- `/handoff-route`：`message_at_utc` / `deadline_utc` 不是以 `Z` 结尾的
+  UTC 时刻、两时刻未严格递增或相距超过 31 天、`duration_minutes` 不在
+  1～1440、员工数不在 1～20、员工 ID 重复、`holder_id` / `target_id`
+  引用不存在的员工，或任一员工的日程字段校验失败
+  （规则与 `/overlaps` 单侧一致）。窗口内无法在截止前交接至目标不是
+  非法输入，返回 `200` 且 `arrival_utc` 为 `null`
+
+## curl 请求示例
+
+```bash
+# /handoff-route：alice 与 carol 无共同在岗，消息经 bob 中转交接
+curl -s http://localhost:8000/handoff-route \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "message_at_utc": "2026-03-02T00:00:00Z",
+    "deadline_utc": "2026-03-03T00:00:00Z",
+    "duration_minutes": 30,
+    "holder_id": "alice",
+    "target_id": "carol",
+    "employees": [
+      {"id": "alice", "schedules": [{
+        "timezone": "UTC", "start_date": "2026-03-02", "end_date": "2026-03-02",
+        "weekdays": [0], "local_time": "08:00", "duration_minutes": 120}]},
+      {"id": "bob", "schedules": [
+        {"timezone": "UTC", "start_date": "2026-03-02", "end_date": "2026-03-02",
+         "weekdays": [0], "local_time": "08:30", "duration_minutes": 60},
+        {"timezone": "UTC", "start_date": "2026-03-02", "end_date": "2026-03-02",
+         "weekdays": [0], "local_time": "11:00", "duration_minutes": 60}]},
+      {"id": "carol", "schedules": [{
+        "timezone": "UTC", "start_date": "2026-03-02", "end_date": "2026-03-02",
+        "weekdays": [0], "local_time": "11:00", "duration_minutes": 120}]}
+    ]'
+```
 
 ## 判定原理
 
@@ -561,9 +740,9 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route 与 /health
   models.py      # 请求/响应模型与 422 校验规则
-  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举 + 排班变更集合差对账
+  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举 + 排班变更集合差对账 + 共同在岗区间交集与交接链最短路
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml
