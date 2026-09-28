@@ -1,8 +1,11 @@
+# 单条命令启动全部接口（含 POST /handoff-route）：docker compose up --build
+# 依赖在镜像构建阶段安装完毕，容器启动即完成初始化；服务监听容器内 8000 端口
 services:
   api:
     build: .
     image: civil-scheduler-api
     ports:
+      # 宿主机端口可用 PORT 环境变量覆盖，默认映射到 8000
       - "${PORT:-8000}:8000"
     restart: unless-stopped
     healthcheck:

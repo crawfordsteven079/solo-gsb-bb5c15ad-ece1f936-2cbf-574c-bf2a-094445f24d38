@@ -15,6 +15,9 @@ from .models import (
     ExpandRequest,
     ExpandResponse,
     FreeSlotOut,
+    HandoffLegOut,
+    HandoffRouteRequest,
+    HandoffRouteResponse,
     OverlapRequest,
     OverlapResponse,
     RestViolationOut,
@@ -31,6 +34,7 @@ from .scheduler import (
     common_free_slots,
     expand_schedule,
     find_overlaps,
+    handoff_route,
     instance_payload,
     occupancy_by_day,
     rest_violations,
@@ -50,7 +54,9 @@ app = FastAPI(
         "按 UTC 窗口扫描多员工在岗人数缺口，"
         "检查同一员工相邻工作段之间的休息是否低于最低分钟数，"
         "以及在 UTC 窗口内按步长网格枚举多名参与者共同空闲的预约槽，"
-        "并对账同一员工变更前后两版日程在 UTC 窗口内的取消与新增区间。"
+        "并对账同一员工变更前后两版日程在 UTC 窗口内的取消与新增区间；"
+        "最后在多名员工间规划一条消息交接链，"
+        "要求每段交接完整落在双方连续共同在岗期间。"
     ),
 )
 
@@ -321,4 +327,51 @@ def schedule_changes_check(req: ScheduleChangesRequest) -> ScheduleChangesRespon
         added_count=len(added_out),
         added_total_minutes=sum(a.minutes for a in added_out),
         added=added_out,
+    )
+
+
+@app.post(
+    "/handoff-route",
+    response_model=HandoffRouteResponse,
+    summary="规划最早到达目标的交接链",
+)
+def handoff_route_check(req: HandoffRouteRequest) -> HandoffRouteResponse:
+    # 每名员工的各条日程按原 gap/fold 策略展开，实例按真实时长转为半开 UTC 区间，
+    # 相交或相接者由 handoff_route 内的合并处理（重复实例不重复占用）
+    employee_intervals: dict[str, list[tuple[datetime, datetime]]] = {}
+    for emp in req.employees:
+        intervals: list[tuple[datetime, datetime]] = []
+        for side in emp.schedules or []:
+            tz = ZoneInfo(side.timezone)
+            instances, _ = expand_schedule(
+                tz=tz,
+                start_date=side.start_date,
+                end_date=side.end_date,
+                weekdays=side.weekdays,
+                local_time=side.local_time,
+                gap_strategy=side.gap_strategy.value,
+                fold_strategy=side.fold_strategy.value,
+            )
+            span = timedelta(minutes=side.duration_minutes)
+            intervals.extend((i.utc, i.utc + span) for i in instances)
+        employee_intervals[emp.id] = intervals
+    arrival, legs = handoff_route(
+        message_created=req.message_created_utc,
+        deadline=req.deadline_utc,
+        handoff_minutes=req.handoff_minutes,
+        initial_holder=req.initial_holder,
+        target=req.target,
+        employee_intervals=employee_intervals,
+    )
+    return HandoffRouteResponse(
+        arrival_utc=utc_iso(arrival) if arrival is not None else None,
+        legs=[
+            HandoffLegOut(
+                from_id=leg.from_id,
+                to_id=leg.to_id,
+                start_utc=utc_iso(leg.start),
+                end_utc=utc_iso(leg.end),
+            )
+            for leg in legs
+        ],
     )

@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app.scheduler import (
+    HandoffLeg,
     Instance,
     RestViolation,
     StaffingGap,
@@ -11,6 +12,7 @@ from app.scheduler import (
     common_free_slots,
     expand_schedule,
     find_overlaps,
+    handoff_route,
     interval_difference,
     merge_intervals,
     occupancy_by_day,
@@ -691,3 +693,269 @@ def test_schedule_changes_empty_sides():
         before_intervals=[],
         after_intervals=[],
     ) == ([], [])
+
+
+# --- handoff_route ----------------------------------------------------------
+
+
+def _handoff(initial_holder="alice", target="bob", ready=8, deadline_day=2, **kw):
+    defaults = dict(
+        message_created=_utc(1, ready),
+        deadline=_utc(deadline_day, 0),
+        handoff_minutes=30,
+        initial_holder=initial_holder,
+        target=target,
+    )
+    defaults.update(kw)
+    return handoff_route(**defaults)
+
+
+def test_handoff_route_direct_earliest_common_segment():
+    # alice [08:00,12:00)，bob [10:00,14:00)：共同在岗 [10:00,12:00)，交接 30
+    arrival, legs = _handoff(
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 12))],
+            "bob": [(_utc(1, 10), _utc(1, 14))],
+        }
+    )
+    assert arrival == _utc(1, 10, 30)
+    assert legs == [HandoffLeg("alice", "bob", _utc(1, 10), _utc(1, 10, 30))]
+
+
+def test_handoff_route_waits_for_message_readiness():
+    # 消息 08:30 才产生，尽管共同在岗自 08:00 起，交接只能 [08:30,09:00)
+    arrival, legs = handoff_route(
+        message_created=_utc(1, 8, 30),
+        deadline=_utc(2, 0),
+        handoff_minutes=30,
+        initial_holder="alice",
+        target="bob",
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9))],
+            "bob": [(_utc(1, 8), _utc(1, 9))],
+        },
+    )
+    assert arrival == _utc(1, 9)
+    assert legs == [HandoffLeg("alice", "bob", _utc(1, 8, 30), _utc(1, 9))]
+
+
+def test_handoff_route_holder_off_duty_keeps_message_and_waits():
+    # alice 08:00 在岗拿到消息后离岗，与 bob 的共同在岗要等到 [12:00,13:00)
+    arrival, legs = _handoff(
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9)), (_utc(1, 12), _utc(1, 13))],
+            "bob": [(_utc(1, 12), _utc(1, 13))],
+        }
+    )
+    assert arrival == _utc(1, 12, 30)
+    assert legs == [HandoffLeg("alice", "bob", _utc(1, 12), _utc(1, 12, 30))]
+
+
+def test_handoff_route_initial_holder_not_on_duty_at_creation():
+    # 消息产生时 alice 尚未上岗（09:00 才上岗），仍可等待
+    arrival, legs = _handoff(
+        employee_intervals={
+            "alice": [(_utc(1, 9), _utc(1, 10))],
+            "bob": [(_utc(1, 9), _utc(1, 10))],
+        }
+    )
+    assert arrival == _utc(1, 9, 30)
+    assert legs == [HandoffLeg("alice", "bob", _utc(1, 9), _utc(1, 9, 30))]
+
+
+def test_handoff_route_chain_with_path_reconstruction():
+    # alice [08:00,09:00)，bob [08:30,10:00)，carol [09:30,12:00)
+    # alice->bob [08:30,09:00)（bob 09:00 获得），bob->carol [09:30,10:00)
+    arrival, legs = _handoff(
+        target="carol",
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9))],
+            "bob": [(_utc(1, 8, 30), _utc(1, 10))],
+            "carol": [(_utc(1, 9, 30), _utc(1, 12))],
+        },
+    )
+    assert arrival == _utc(1, 10)
+    assert legs == [
+        HandoffLeg("alice", "bob", _utc(1, 8, 30), _utc(1, 9)),
+        HandoffLeg("bob", "carol", _utc(1, 9, 30), _utc(1, 10)),
+    ]
+
+
+def test_handoff_route_sender_must_hold_message_first():
+    # alice [08:00,08:10)&[09:00,10:00)，bob [08:00,12:00)，
+    # carol [08:30,09:00)&[10:00,12:00)；交接 30 分钟
+    # alice->bob 第一段共同在岗仅 10 分钟放不下 -> [09:00,09:30)，bob 09:30 获得；
+    # bob->carol 的共同段 [08:30,09:00) 已在 bob 持有前过期 -> 必须等 [10:00,10:30)；
+    # alice 与 carol 仅边界相接，无法直达
+    arrival, legs = _handoff(
+        target="carol",
+        employee_intervals={
+            "alice": [
+                (_utc(1, 8), _utc(1, 8, 10)),
+                (_utc(1, 9), _utc(1, 10)),
+            ],
+            "bob": [(_utc(1, 8), _utc(1, 12))],
+            "carol": [
+                (_utc(1, 8, 30), _utc(1, 9)),
+                (_utc(1, 10), _utc(1, 12)),
+            ],
+        },
+    )
+    assert arrival == _utc(1, 10, 30)
+    assert legs == [
+        HandoffLeg("alice", "bob", _utc(1, 9), _utc(1, 9, 30)),
+        HandoffLeg("bob", "carol", _utc(1, 10), _utc(1, 10, 30)),
+    ]
+
+
+def test_handoff_route_prefers_earliest_arrival_over_hop_count():
+    # 三跳长链可在 11:30 到达，直达共同在岗 [12:00,13:00) 更晚 -> 选长链
+    arrival, legs = _handoff(
+        target="dave",
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9))],
+            "bob": [(_utc(1, 8, 30), _utc(1, 10))],
+            "carol": [(_utc(1, 9, 30), _utc(1, 11))],
+            "dave": [
+                (_utc(1, 10, 30), _utc(1, 12)),  # 长链经此 [10:30,11:00)->11:00 到达
+                (_utc(1, 12), _utc(1, 13)),  # alice 直达共同在岗 [12:00,13:00)
+            ],
+        },
+    )
+    assert arrival == _utc(1, 11)
+    assert [(leg.from_id, leg.to_id) for leg in legs] == [
+        ("alice", "bob"),
+        ("bob", "carol"),
+        ("carol", "dave"),
+    ]
+
+
+def test_handoff_route_common_segment_shorter_than_duration():
+    # 共同在岗仅 20 分钟，交接需 30 分钟 -> 不可交接
+    arrival, legs = _handoff(
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 8, 20))],
+            "bob": [(_utc(1, 8), _utc(1, 8, 20))],
+        }
+    )
+    assert arrival is None
+    assert legs == []
+
+
+def test_handoff_route_no_overlap_unreachable():
+    # 两段仅相接，半开区间无共同在岗
+    arrival, legs = _handoff(
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9))],
+            "bob": [(_utc(1, 9), _utc(1, 10))],
+        }
+    )
+    assert arrival is None
+    assert legs == []
+
+
+def test_handoff_route_arrival_after_deadline_returns_none():
+    # 最早 [11:00,11:30) 到达 11:30；截止 11:00 -> 无解
+    arrival, legs = handoff_route(
+        message_created=_utc(1, 8),
+        deadline=_utc(1, 11),
+        handoff_minutes=30,
+        initial_holder="alice",
+        target="bob",
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 12))],
+            "bob": [(_utc(1, 11), _utc(1, 13))],
+        },
+    )
+    assert arrival is None
+    assert legs == []
+
+
+def test_handoff_route_arrival_equal_to_deadline_allowed():
+    # 到达时刻恰好等于截止时刻，允许
+    arrival, legs = handoff_route(
+        message_created=_utc(1, 8),
+        deadline=_utc(1, 11, 30),
+        handoff_minutes=30,
+        initial_holder="alice",
+        target="bob",
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 12))],
+            "bob": [(_utc(1, 11), _utc(1, 13))],
+        },
+    )
+    assert arrival == _utc(1, 11, 30)
+    assert len(legs) == 1
+
+
+def test_handoff_route_initial_holder_is_target():
+    arrival, legs = _handoff(
+        target="alice",
+        employee_intervals={"alice": [], "bob": [(_utc(1, 8), _utc(1, 9))]},
+    )
+    assert arrival == _utc(1, 8)  # 直接返回消息产生时刻
+    assert legs == []
+
+
+def test_handoff_route_merges_touching_intervals_for_continuous_common():
+    # alice 两段相接日程合并为 [08:00,10:00)，交接 90 分钟必须完整落在合并段内
+    arrival, legs = _handoff(
+        handoff_minutes=90,
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9)), (_utc(1, 9), _utc(1, 10))],
+            "bob": [(_utc(1, 8), _utc(1, 10))],
+        },
+    )
+    assert arrival == _utc(1, 9, 30)
+    assert legs == [HandoffLeg("alice", "bob", _utc(1, 8), _utc(1, 9, 30))]
+
+    # 不合并（视为两段 60 分钟）则 90 分钟无处可放
+    arrival, legs = _handoff(
+        handoff_minutes=90,
+        employee_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9)), (_utc(1, 9, 30), _utc(1, 10, 30))],
+            "bob": [(_utc(1, 8), _utc(1, 11))],
+        },
+    )
+    assert arrival is None
+    assert legs == []
+
+
+def test_handoff_route_duplicate_intervals_counted_once():
+    # 完全重复的区间合并后仍是一段（不影响共同在岗长度）
+    arrival, legs = _handoff(
+        employee_intervals={
+            "alice": [
+                (_utc(1, 8), _utc(1, 9)),
+                (_utc(1, 8), _utc(1, 9)),
+            ],
+            "bob": [(_utc(1, 8), _utc(1, 9))],
+        }
+    )
+    assert arrival == _utc(1, 8, 30)
+    assert len(legs) == 1
+
+
+def test_handoff_route_empty_schedules():
+    # 任一方无排班则无法完成交接
+    arrival, legs = _handoff(
+        employee_intervals={"alice": [], "bob": []}
+    )
+    assert arrival is None
+    assert legs == []
+
+
+def test_intersect_intervals_basic_and_touching():
+    from app.scheduler import _intersect_intervals
+
+    a = [(_utc(1, 8), _utc(1, 10)), (_utc(1, 11), _utc(1, 12))]
+    b = [(_utc(1, 9), _utc(1, 11)), (_utc(1, 11, 30), _utc(1, 12, 30))]
+    # 相交 [09:00,10:00)；[10:00,11:00) 与 a 无交；相接于 11:00 不算；[11:30,12:00)
+    assert _intersect_intervals(a, b) == [
+        (_utc(1, 9), _utc(1, 10)),
+        (_utc(1, 11, 30), _utc(1, 12)),
+    ]
+    assert _intersect_intervals(
+        [(_utc(1, 8), _utc(1, 9))], [(_utc(1, 9), _utc(1, 10))]
+    ) == []
+    assert _intersect_intervals([], [(_utc(1, 9), _utc(1, 10))]) == []

@@ -14,7 +14,11 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 按**以窗口起点为原点的步长网格**枚举能完整容纳预约的起止时刻；
 `POST /schedule-changes` 对账同一员工**变更前后两版日程**，
 在半开 UTC 窗口内比较两版工作时间集合，
-输出**取消与新增的最大连续区间**、每段真实分钟数及两类总分钟数。
+输出**取消与新增的最大连续区间**、每段真实分钟数及两类总分钟数；
+`POST /handoff-route` 在最多 20 名员工间规划一条**消息交接链**，
+每名员工的日程展开为真实时长的半开 UTC 在岗区间并合并相交或相接者，
+每次交接须在双方**连续共同在岗**期间完整完成，
+返回消息**不晚于截止时刻到达目标的最早时间**及一条交接链。
 
 ## 快速启动（单条命令）
 
@@ -22,12 +26,13 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 docker compose up --build
 ```
 
-依赖（FastAPI / uvicorn / tzdata）在镜像构建时安装完毕，容器启动即可服务。
+依赖（FastAPI / uvicorn / tzdata）在镜像构建时安装完毕，容器启动即完成初始化、
+无需任何额外准备步骤，全部接口（含 `POST /handoff-route`）随服务一键启动。
 
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`
+- 接口（均为 POST，端口同为 8000）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`、`/handoff-route`
 
 ## 配置
 
@@ -521,6 +526,123 @@ docker compose up --build
 | `start_utc` / `end_utc` | 差异区间起止（半开，UTC，Z 结尾） |
 | `minutes` | 区间真实分钟数（UTC 流逝） |
 
+### `POST /handoff-route`
+
+在多名员工（**1～20** 名，ID 唯一）间规划一条**消息交接链**。每名员工携带
+**可为空**的日程列表（`schedules`，与 `/overlaps` 单侧参数与校验完全一致）；
+各日程按既有跳时 / 叠时策略展开后，实例按真实时长解释为**半开 UTC 在岗区间**
+`[start, start+duration)`，同一员工**相交或相接的区间先合并**
+（重复实例不重复占用，相接日程视为连续在岗）。
+
+规则：
+
+- **任意两人可交接**，但一次交接 `[start, start+handoff_minutes)` 必须完整落在
+  双方某一段**连续共同在岗**区间内（半开区间：仅边界相接不算共同在岗）。
+- **发送者获得消息后才能开始**；**接收者在交接终点获得消息**。
+- 员工**离岗仍保留消息并可等待**（等待不占用在岗时间），因此下一次交接可以
+  落在之后任意一段共同在岗区间；消息产生时初始持有人尚未上岗也允许等待。
+- 求消息**不晚于 `deadline_utc`** 到达 `target` 的**最早时刻**（到达时刻恰好
+  等于截止时刻视为可行；存在多条最早方案时**并列可任选一条**），并返回该时刻
+  与一条交接链。**初始持有人即目标**时直接返回消息产生时刻与空链；
+  不可达或最早到达晚于截止时刻时返回 `arrival_utc = null` 与空链。
+
+请求体：
+
+```json
+{
+  "message_created_utc": "2026-03-02T08:00:00Z",
+  "deadline_utc": "2026-03-03T00:00:00Z",
+  "handoff_minutes": 30,
+  "initial_holder": "alice",
+  "target": "carol",
+  "employees": [
+    {
+      "id": "alice",
+      "schedules": [
+        {
+          "timezone": "UTC",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "08:00",
+          "duration_minutes": 60
+        }
+      ]
+    },
+    {
+      "id": "bob",
+      "schedules": [
+        {
+          "timezone": "UTC",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "08:30",
+          "duration_minutes": 90
+        }
+      ]
+    },
+    {
+      "id": "carol",
+      "schedules": [
+        {
+          "timezone": "UTC",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "09:30",
+          "duration_minutes": 150
+        }
+      ]
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `message_created_utc` | string | 消息产生时刻（初始持有人此时刻持有消息），UTC ISO 8601 且**以 `Z` 结尾** |
+| `deadline_utc` | string | 截止时刻，UTC ISO 8601 且**以 `Z` 结尾**；两时刻须严格递增且相距**不超过 31 天** |
+| `handoff_minutes` | int | 单次交接时长（分钟），`1`～`1440` |
+| `initial_holder` | string | 初始持有人员工 ID，必须在 `employees` 中存在 |
+| `target` | string | 目标员工 ID，必须在 `employees` 中存在 |
+| `employees` | object[] | `1`～`20` 名员工，`id` 唯一 |
+| `employees[].id` | string | 员工唯一 ID |
+| `employees[].schedules` | object[] \| null | 日程列表（与 `/overlaps` 单侧相同）；`null` 或空列表表示全程无排班 |
+
+响应 `200`（`legs` 按时间排序，形成一条从 `initial_holder` 到 `target` 的链）：
+
+```json
+{
+  "arrival_utc": "2026-03-02T10:00:00Z",
+  "legs": [
+    {"from_id": "alice", "to_id": "bob", "start_utc": "2026-03-02T08:30:00Z", "end_utc": "2026-03-02T09:00:00Z"},
+    {"from_id": "bob", "to_id": "carol", "start_utc": "2026-03-02T09:30:00Z", "end_utc": "2026-03-02T10:00:00Z"}
+  ]
+}
+```
+
+上例中 alice 在岗 `[08:00,09:00)`、bob `[08:30,10:00)`、carol `[09:30,12:00)` UTC；
+alice 与 carol 无共同在岗，故消息先于共同在岗 `[08:30,09:00)` 交接给 bob
+（bob 09:00 获得），bob 等待至与 carol 的共同在岗 `[09:30,12:00)` 起交接 30 分钟，
+carol 于 10:00 获得消息。
+
+无解 / 初始即目标时分别返回：
+
+```json
+{"arrival_utc": null, "legs": []}
+```
+
+```json
+{"arrival_utc": "2026-03-02T08:00:00Z", "legs": []}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `arrival_utc` | 不晚于截止时刻到达目标的最早时刻（UTC，Z 结尾）；无解为 `null` |
+| `legs[].from_id` / `legs[].to_id` | 本次交接的发送方 / 接收方员工 ID |
+| `legs[].start_utc` / `legs[].end_utc` | 交接区间起止（半开，UTC，Z 结尾）；`end_utc` 即接收方获得消息的时刻 |
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -540,6 +662,11 @@ docker compose up --build
   （规则与 `/overlaps` 单侧一致）
 - `/schedule-changes`：窗口起止不是以 `Z` 结尾的 UTC 时刻、窗口未递增或
   超过 31 天，或任一版本的日程字段校验失败（规则与 `/overlaps` 单侧一致）
+- `/handoff-route`：消息产生 / 截止时刻不是以 `Z` 结尾的 UTC 时刻、
+  两时刻未严格递增或相距超过 31 天、`handoff_minutes` 不在 1～1440、
+  员工数不在 1～20、员工 ID 重复、`initial_holder` 或 `target`
+  引用了不存在的员工 ID，或任一员工的日程字段校验失败
+  （规则与 `/overlaps` 单侧一致）
 
 ## 判定原理
 
@@ -561,11 +688,11 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route 与 /health
   models.py      # 请求/响应模型与 422 校验规则
-  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举 + 排班变更集合差对账
+  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举 + 排班变更集合差对账 + 交接链 Dijkstra 寻路
 tests/           # pytest 测试（核心逻辑 + API）
-Dockerfile
+Dockerfile       # 镜像构建时装齐依赖，启动即在 8000 端口服务全部接口
 docker-compose.yml
 requirements.txt
 requirements-dev.txt

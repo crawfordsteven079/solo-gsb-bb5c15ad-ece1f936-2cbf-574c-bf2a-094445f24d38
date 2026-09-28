@@ -1917,3 +1917,529 @@ def test_schedule_changes_reuses_schedule_validation():
         ),
     )
     assert resp.status_code == 422
+
+
+# --- POST /handoff-route ----------------------------------------------------
+
+HANDOFF_WINDOW = {
+    "message_created_utc": "2026-03-02T08:00:00Z",
+    "deadline_utc": "2026-03-03T00:00:00Z",
+}
+
+
+def _handoff_payload(**overrides):
+    payload = {
+        **HANDOFF_WINDOW,
+        "handoff_minutes": 30,
+        "initial_holder": "alice",
+        "target": "bob",
+        "employees": [
+            {"id": "alice", "schedules": [_utc_schedule("08:00", 240)]},
+            {"id": "bob", "schedules": [_utc_schedule("10:00", 240)]},
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_handoff_route_basic():
+    # alice [08:00,12:00)，bob [10:00,14:00)：共同在岗 [10:00,12:00)，交接 30
+    resp = client.post("/handoff-route", json=_handoff_payload())
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "arrival_utc": "2026-03-02T10:30:00Z",
+        "legs": [
+            {
+                "from_id": "alice",
+                "to_id": "bob",
+                "start_utc": "2026-03-02T10:00:00Z",
+                "end_utc": "2026-03-02T10:30:00Z",
+            }
+        ],
+    }
+
+
+def test_handoff_route_chain():
+    # alice [08:00,09:00)，bob [08:30,10:00)，carol [09:30,12:00)
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            target="carol",
+            employees=[
+                {"id": "alice", "schedules": [_utc_schedule("08:00", 60)]},
+                {"id": "bob", "schedules": [_utc_schedule("08:30", 90)]},
+                {"id": "carol", "schedules": [_utc_schedule("09:30", 150)]},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "arrival_utc": "2026-03-02T10:00:00Z",
+        "legs": [
+            {
+                "from_id": "alice",
+                "to_id": "bob",
+                "start_utc": "2026-03-02T08:30:00Z",
+                "end_utc": "2026-03-02T09:00:00Z",
+            },
+            {
+                "from_id": "bob",
+                "to_id": "carol",
+                "start_utc": "2026-03-02T09:30:00Z",
+                "end_utc": "2026-03-02T10:00:00Z",
+            },
+        ],
+    }
+
+
+def test_handoff_route_sender_must_hold_message_first():
+    # alice [08:00,08:10)&[09:00,10:00)，bob [08:00,12:00)，
+    # carol [08:30,09:00)&[10:00,12:00)：bob 09:30 才拿到消息，
+    # [08:30,09:00) 的共同段已过期，只能用 [10:00,10:30)
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            target="carol",
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [_utc_schedule("08:00", 10), _utc_schedule("09:00")],
+                },
+                {"id": "bob", "schedules": [_utc_schedule("08:00", 240)]},
+                {
+                    "id": "carol",
+                    "schedules": [_utc_schedule("08:30", 30), _utc_schedule("10:00", 120)],
+                },
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["arrival_utc"] == "2026-03-02T10:30:00Z"
+    assert [
+        (leg["from_id"], leg["to_id"], leg["start_utc"], leg["end_utc"])
+        for leg in body["legs"]
+    ] == [
+        ("alice", "bob", "2026-03-02T09:00:00Z", "2026-03-02T09:30:00Z"),
+        ("bob", "carol", "2026-03-02T10:00:00Z", "2026-03-02T10:30:00Z"),
+    ]
+
+
+def test_handoff_route_off_duty_keeps_message_and_waits():
+    # alice 拿到消息后离岗，共同在岗等到 [12:00,13:00)
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [_utc_schedule("08:00"), _utc_schedule("12:00")],
+                },
+                {"id": "bob", "schedules": [_utc_schedule("12:00")]},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "arrival_utc": "2026-03-02T12:30:00Z",
+        "legs": [
+            {
+                "from_id": "alice",
+                "to_id": "bob",
+                "start_utc": "2026-03-02T12:00:00Z",
+                "end_utc": "2026-03-02T12:30:00Z",
+            }
+        ],
+    }
+
+
+def test_handoff_route_merges_touching_intervals():
+    # alice 两段相接合并为连续在岗 [08:00,10:00)，可完整容纳 90 分钟交接
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            handoff_minutes=90,
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [_utc_schedule("08:00"), _utc_schedule("09:00")],
+                },
+                {"id": "bob", "schedules": [_utc_schedule("08:00", 120)]},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "arrival_utc": "2026-03-02T09:30:00Z",
+        "legs": [
+            {
+                "from_id": "alice",
+                "to_id": "bob",
+                "start_utc": "2026-03-02T08:00:00Z",
+                "end_utc": "2026-03-02T09:30:00Z",
+            }
+        ],
+    }
+
+
+def test_handoff_route_common_segment_too_short_null():
+    # 共同在岗仅 20 分钟，交接需 30 分钟
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            employees=[
+                {"id": "alice", "schedules": [_utc_schedule("08:00", 20)]},
+                {"id": "bob", "schedules": [_utc_schedule("08:00", 20)]},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"arrival_utc": None, "legs": []}
+
+
+def test_handoff_route_no_common_on_duty_null():
+    # alice [08:00,09:00)，bob [10:00,11:00)，无共同在岗
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            employees=[
+                {"id": "alice", "schedules": [_utc_schedule("08:00")]},
+                {"id": "bob", "schedules": [_utc_schedule("10:00")]},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"arrival_utc": None, "legs": []}
+
+
+def test_handoff_route_empty_schedules_null():
+    # null / 缺省 schedules 表示无排班，无法交接
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            employees=[{"id": "alice", "schedules": None}, {"id": "bob"}]
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"arrival_utc": None, "legs": []}
+
+
+def test_handoff_route_deadline_exceeded_null():
+    # 最早到达 11:30，截止 11:00 -> 无解
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            deadline_utc="2026-03-02T11:00:00Z",
+            employees=[
+                {"id": "alice", "schedules": [_utc_schedule("08:00", 240)]},
+                {"id": "bob", "schedules": [_utc_schedule("11:00", 120)]},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"arrival_utc": None, "legs": []}
+
+
+def test_handoff_route_arrival_equal_to_deadline_allowed():
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            deadline_utc="2026-03-02T11:30:00Z",
+            employees=[
+                {"id": "alice", "schedules": [_utc_schedule("08:00", 240)]},
+                {"id": "bob", "schedules": [_utc_schedule("11:00", 120)]},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["arrival_utc"] == "2026-03-02T11:30:00Z"
+
+
+def test_handoff_route_initial_holder_is_target():
+    resp = client.post("/handoff-route", json=_handoff_payload(target="alice"))
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "arrival_utc": "2026-03-02T08:00:00Z",
+        "legs": [],
+    }
+
+
+def test_handoff_route_reuses_fold_both():
+    # 纽约 2026-11-01 01:30 出现两次（05:30 / 06:30 UTC），各 60 分钟且相接
+    # -> alice 连续在岗 [05:30,07:30)；bob UTC [06:30,07:30)
+    resp = client.post(
+        "/handoff-route",
+        json={
+            "message_created_utc": "2026-11-01T05:00:00Z",
+            "deadline_utc": "2026-11-02T00:00:00Z",
+            "handoff_minutes": 30,
+            "initial_holder": "alice",
+            "target": "bob",
+            "employees": [
+                {
+                    "id": "alice",
+                    "schedules": [
+                        {
+                            "timezone": "America/New_York",
+                            "start_date": "2026-11-01",
+                            "end_date": "2026-11-01",
+                            "weekdays": [6],
+                            "local_time": "01:30",
+                            "fold_strategy": "both",
+                            "duration_minutes": 60,
+                        }
+                    ],
+                },
+                {
+                    "id": "bob",
+                    "schedules": [
+                        {
+                            "timezone": "UTC",
+                            "start_date": "2026-11-01",
+                            "end_date": "2026-11-01",
+                            "weekdays": [6],
+                            "local_time": "06:30",
+                            "duration_minutes": 60,
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "arrival_utc": "2026-11-01T07:00:00Z",
+        "legs": [
+            {
+                "from_id": "alice",
+                "to_id": "bob",
+                "start_utc": "2026-11-01T06:30:00Z",
+                "end_utc": "2026-11-01T07:00:00Z",
+            }
+        ],
+    }
+
+
+def test_handoff_route_reuses_gap_shift_forward():
+    # 纽约 2026-03-08 02:30 不存在；shift_forward 后 alice 在岗 [07:30,08:30)
+    # bob UTC [08:00,09:00)：共同在岗 [08:00,08:30)，交接 30
+    resp = client.post(
+        "/handoff-route",
+        json={
+            "message_created_utc": "2026-03-08T07:00:00Z",
+            "deadline_utc": "2026-03-09T00:00:00Z",
+            "handoff_minutes": 30,
+            "initial_holder": "alice",
+            "target": "bob",
+            "employees": [
+                {
+                    "id": "alice",
+                    "schedules": [
+                        {
+                            "timezone": "America/New_York",
+                            "start_date": "2026-03-08",
+                            "end_date": "2026-03-08",
+                            "weekdays": [6],
+                            "local_time": "02:30",
+                            "gap_strategy": "shift_forward",
+                            "duration_minutes": 60,
+                        }
+                    ],
+                },
+                {
+                    "id": "bob",
+                    "schedules": [
+                        {
+                            "timezone": "UTC",
+                            "start_date": "2026-03-08",
+                            "end_date": "2026-03-08",
+                            "weekdays": [6],
+                            "local_time": "08:00",
+                            "duration_minutes": 60,
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["arrival_utc"] == "2026-03-08T08:30:00Z"
+    assert resp.json()["legs"][0] == {
+        "from_id": "alice",
+        "to_id": "bob",
+        "start_utc": "2026-03-08T08:00:00Z",
+        "end_utc": "2026-03-08T08:30:00Z",
+    }
+
+
+def test_handoff_route_window_must_be_z_utc_422():
+    # 缺少 Z 后缀 / 用 +00:00 代替 Z 均非法
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(message_created_utc="2026-03-02T08:00:00"),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(deadline_utc="2026-03-03T00:00:00+00:00"),
+    )
+    assert resp.status_code == 422
+
+
+def test_handoff_route_window_not_increasing_422():
+    # 相等与逆序都非法
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(deadline_utc="2026-03-02T08:00:00Z"),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            message_created_utc="2026-03-02T12:00:00Z",
+            deadline_utc="2026-03-02T08:00:00Z",
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_handoff_route_window_over_31_days_422():
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            message_created_utc="2026-01-01T00:00:00Z",
+            deadline_utc="2026-02-02T00:00:00Z",  # 32 天
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_handoff_route_window_exactly_31_days_ok():
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            message_created_utc="2026-01-01T00:00:00Z",
+            deadline_utc="2026-02-01T00:00:00Z",  # 恰好 31 天
+            employees=[{"id": "alice"}, {"id": "bob"}],
+        ),
+    )
+    assert resp.status_code == 200
+
+
+def test_handoff_route_handoff_minutes_bounds_422():
+    resp = client.post("/handoff-route", json=_handoff_payload(handoff_minutes=0))
+    assert resp.status_code == 422
+
+    resp = client.post("/handoff-route", json=_handoff_payload(handoff_minutes=1441))
+    assert resp.status_code == 422
+
+    # 边界值 1 与 1440 合法（初始即目标，不看日程）
+    for minutes in (1, 1440):
+        resp = client.post(
+            "/handoff-route",
+            json=_handoff_payload(target="alice", handoff_minutes=minutes),
+        )
+        assert resp.status_code == 200
+
+
+def test_handoff_route_employee_count_bounds():
+    resp = client.post("/handoff-route", json=_handoff_payload(employees=[]))
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            target="e20", employees=[{"id": f"e{i}"} for i in range(21)]
+        ),
+    )
+    assert resp.status_code == 422
+
+    # 20 名合法
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            initial_holder="e0",
+            target="e19",
+            employees=[{"id": f"e{i}"} for i in range(20)],
+        ),
+    )
+    assert resp.status_code == 200
+
+
+def test_handoff_route_duplicate_employee_ids_422():
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            employees=[
+                {"id": "alice", "schedules": [_utc_schedule("08:00", 240)]},
+                {"id": "alice", "schedules": [_utc_schedule("10:00", 240)]},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_handoff_route_unknown_reference_422():
+    # 初始持有人 / 目标引用不存在的员工 ID 均 422
+    resp = client.post(
+        "/handoff-route", json=_handoff_payload(initial_holder="nobody")
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/handoff-route", json=_handoff_payload(target="nobody")
+    )
+    assert resp.status_code == 422
+
+
+def test_handoff_route_reuses_schedule_validation():
+    # 日程沿用 /overlaps 单侧校验：非法时区 / 时长越界 / 区间超 366 天均 422
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [{**STAFF_SCHED_BERLIN, "timezone": "Not/AZone"}],
+                },
+                {"id": "bob"},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [{**STAFF_SCHED_BERLIN, "duration_minutes": 0}],
+                },
+                {"id": "bob"},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/handoff-route",
+        json=_handoff_payload(
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [
+                        {
+                            **STAFF_SCHED_BERLIN,
+                            "start_date": "2026-01-01",
+                            "end_date": "2027-01-03",
+                        }
+                    ],
+                },
+                {"id": "bob"},
+            ]
+        ),
+    )
+    assert resp.status_code == 422

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Iterable, Literal
@@ -431,6 +432,131 @@ def schedule_changes(
     before = _clip_merge(before_intervals)
     after = _clip_merge(after_intervals)
     return interval_difference(before, after), interval_difference(after, before)
+
+
+@dataclass(frozen=True)
+class HandoffLeg:
+    """一次交接：发送方 / 接收方员工 ID 与交接区间的 UTC 起止（半开）。
+
+    接收方在 end 时刻获得消息。
+    """
+
+    from_id: str
+    to_id: str
+    start: datetime
+    end: datetime
+
+
+def _intersect_intervals(
+    a: list[tuple[datetime, datetime]],
+    b: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """两组已合并（两两不相交、按起点排序）半开区间的交集段，同样按起点排序。
+
+    边界相接（一段终点等于另一段起点）交集为空。
+    """
+    result: list[tuple[datetime, datetime]] = []
+    i = j = 0
+    while i < len(a) and j < len(b):
+        start = max(a[i][0], b[j][0])
+        end = min(a[i][1], b[j][1])
+        if start < end:
+            result.append((start, end))
+        # 先结束的段前移（终点相同时一起前移）
+        if a[i][1] < b[j][1]:
+            i += 1
+        elif b[j][1] < a[i][1]:
+            j += 1
+        else:
+            i += 1
+            j += 1
+    return result
+
+
+def _earliest_handoff(
+    sender: list[tuple[datetime, datetime]],
+    receiver: list[tuple[datetime, datetime]],
+    ready: datetime,
+    duration: timedelta,
+) -> tuple[datetime, datetime] | None:
+    """发送方不早于 ready 时刻把消息交接给接收方的最早区间。
+
+    交接 [start, start+duration) 须完整落在某一段双方连续共同在岗区间内；
+    共同在岗段按起点升序，start = max(ready, 段起点) 随段非递减，故第一个
+    能完整容纳 duration 的段即为最早完成。无可行区间时返回 None。
+    """
+    for seg_start, seg_end in _intersect_intervals(sender, receiver):
+        start = max(ready, seg_start)
+        if start + duration <= seg_end:
+            return start, start + duration
+    return None
+
+
+def handoff_route(
+    *,
+    message_created: datetime,
+    deadline: datetime,
+    handoff_minutes: int,
+    initial_holder: str,
+    target: str,
+    employee_intervals: dict[str, list[tuple[datetime, datetime]]],
+) -> tuple[datetime | None, list[HandoffLeg]]:
+    """求消息不晚于 deadline 到达 target 的最早时刻及一条交接链。
+
+    每名员工的半开在岗区间先合并（相交或相接者并成一段，重复实例只计一次）。
+    消息在员工手中离岗仍保留并可等待；任意两人可交接，但交接须在双方某段
+    连续共同在岗期间完整完成，发送方获得消息后才能开始，接收方在交接终点
+    获得消息。以“员工 = 节点、到达时刻 = 距离”做 Dijkstra：等待免费，
+    到达时间函数关于出发时刻单调非递减（FIFO），首次 settle 目标即为最早
+    到达；最优到达仍晚于 deadline 或不可达时返回 (None, [])。初始持有人
+    即目标时直接返回 (message_created, [])。
+    """
+    if initial_holder == target:
+        return message_created, []
+
+    duration = timedelta(minutes=handoff_minutes)
+    merged = {
+        emp_id: merge_intervals(intervals)
+        for emp_id, intervals in employee_intervals.items()
+    }
+
+    # dist[员工] = 消息到达该员工的最早时刻；prev 记录上一棒与交接区间
+    dist: dict[str, datetime] = {initial_holder: message_created}
+    prev: dict[str, tuple[str, datetime, datetime]] = {}
+    queue: list[tuple[datetime, str]] = [(message_created, initial_holder)]
+    settled: set[str] = set()
+    while queue:
+        ready, holder = heapq.heappop(queue)
+        if holder in settled:
+            continue
+        settled.add(holder)
+        if holder == target:
+            break
+        for other, other_intervals in merged.items():
+            if other == holder or other in settled:
+                continue
+            slot = _earliest_handoff(
+                merged[holder], other_intervals, ready, duration
+            )
+            if slot is None:
+                continue
+            start, end = slot
+            if other not in dist or end < dist[other]:
+                dist[other] = end
+                prev[other] = (holder, start, end)
+                heapq.heappush(queue, (end, other))
+
+    if target not in settled or dist[target] > deadline:
+        return None, []
+
+    legs: list[HandoffLeg] = []
+    node = target
+    while node != initial_holder:
+        from_id, start, end = prev[node]
+        legs.append(HandoffLeg(from_id, node, start, end))
+        node = from_id
+    legs.reverse()
+    return dist[target], legs
 
 
 def utc_iso(dt: datetime) -> str:
